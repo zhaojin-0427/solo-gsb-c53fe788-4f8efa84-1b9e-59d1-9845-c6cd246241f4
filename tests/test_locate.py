@@ -104,6 +104,58 @@ def build_case(n=4, target=(3.2, 2.1), ncand=6, tol_ms=0.1, drift_ppm=50.0,
     return req, targets
 
 
+def asymmetric_clock_case(target, e_t, drift_ppms, ppm_limit, tol_ms, ncand,
+                          cal_a=(7.0, 5.0), cal_b=(1.0, 1.0),
+                          e_a=0.20, e_b=0.222, offsets=(0.012, -0.008, 0.005)):
+    """两校准点到各麦传播时差很大（Δg≈±21ms）、发射间隔很短（22ms）的场景。
+
+    drift_ppms 为 2/3/4 号麦相对首麦的漂移（ppm）；首麦 o=δ=0。
+    用于回归：速率必须由「本地到达间隔 / (发射间隔 + 该麦传播时差)」给出，
+    偏移由同一时钟关系 t = o + (1+δ)(e + g) 在 A 点取等式。
+    """
+    mics = make_mics(4)
+    mxy = np.array(mics)
+    drifts = [0.0] + [v * 1e-6 for v in drift_ppms]
+    offs = [0.0] + list(offsets)
+
+    def arrivals(pt, e):
+        out = []
+        for i, m in enumerate(mics):
+            g = np.linalg.norm(np.array(pt) - m) / C
+            out.append(offs[i] + (1.0 + drifts[i]) * (e + g))
+        return out
+
+    rng = random.Random(7)
+    per_mic = []
+    direct = arrivals(target, e_t)
+    for i in range(4):
+        times = [direct[i]]
+        for _ in range(ncand - 1):
+            times.append(direct[i] + rng.uniform(0.0012, 0.018))
+        ts = sorted(times)
+        cands = []
+        for j, t in enumerate(ts):
+            s = 0.35 if j == 0 else 6.0 + 3.0 * rng.random()
+            cands.append({"time": float(t), "strength": round(s, 3)})
+        per_mic.append(cands)
+
+    return {
+        "room": {"width": W, "height": H},
+        "microphones": [{"x": x, "y": y} for x, y in mics],
+        "sound_speed": C,
+        "drift_ppm": ppm_limit,
+        "tdoa_tolerance_ms": tol_ms,
+        "resolution": 0.05,
+        "calibrations": [
+            {"position": {"x": cal_a[0], "y": cal_a[1]},
+             "arrivals": arrivals(cal_a, e_a)},
+            {"position": {"x": cal_b[0], "y": cal_b[1]},
+             "arrivals": arrivals(cal_b, e_b)},
+        ],
+        "target": {"candidates": per_mic},
+    }
+
+
 def check(name, cond, detail=""):
     print(f"  [{'PASS' if cond else 'FAIL'}] {name} {detail}")
     if not cond:
@@ -191,6 +243,56 @@ def main():
         check("漂移越界被拒绝", False)
     except LocateError as e:
         check("漂移越界被拒绝", e.code == "DRIFT_EXCEEDED", e.message)
+
+    print("== 7b) 两校准点到各麦路程不同 + 近上限合法漂移不得误报 ==")
+    # 旧算法从本地读数先扣除“未按该麦速率缩放”的传播时间再反推发射间隔：
+    # A 近 3 号麦、B 远 3 号麦（Δg≈21ms）而发射间隔仅 22ms，真实漂移 +45ppm
+    # （上限 50ppm）会被错估成 ~88ppm 而误报 DRIFT_EXCEEDED
+    req_asym = asymmetric_clock_case(target=(3.7, 2.8), e_t=0.221,
+                                     drift_ppms=(45.0, -45.0, 45.0),
+                                     ppm_limit=50.0, tol_ms=0.05, ncand=3)
+    try:
+        ra = solve(req_asym)
+    except LocateError as e:
+        ra = None
+        check("近上限合法漂移不被误报", False, f"{e.code}: {e.message}")
+    if ra is not None:
+        check("近上限合法漂移不被误报", ra["status"] == "OK", ra.get("message", ""))
+        pa = ra.get("position", {})
+        check("位置准确", np.hypot(pa.get("x", 0) - 3.7, pa.get("y", 0) - 2.8) < 0.01)
+        got = {c["mic"]: c["drift_ppm"] for c in ra["clock_calibration"]}
+        check("漂移精确恢复", all(abs(got[m] - v) < 0.01 for m, v in
+                                  ((2, 45.0), (3, -45.0), (4, 45.0))),
+              str(got))
+        got_o = {c["mic"]: c["offset_ms"] for c in ra["clock_calibration"]}
+        check("偏移精确恢复", all(abs(got_o[m] - v) < 1e-3 for m, v in
+                                  ((2, 12.0), (3, -8.0), (4, 5.0))),
+              str(got_o))
+
+    print("== 7c) 速率修正后偏移也由同一时钟关系求出（严容限定位）==")
+    # 499ppm（合法）+ 0.01ms 容限 + 单候选；旧码即使放宽 ppm 上限放过校准，
+    # 偏移项 -g_a 少乘 (1+δ)，换算到首麦时基的 TDOA 带 ~24µs 偏差 -> NO_SOLUTION
+    Tbad = (7.58066511753921, 5.55804332040997)
+    req_off = asymmetric_clock_case(target=Tbad, e_t=0.21862878397772947,
+                                    drift_ppms=(499.0, -499.0, 499.0),
+                                    ppm_limit=2000.0, tol_ms=0.01, ncand=1)
+    roff = solve(req_off)
+    poff = roff.get("position", {})
+    check("偏移修正后严容限可定位", roff["status"] == "OK", roff.get("message", ""))
+    check("位置准确", np.hypot(poff.get("x", 0) - Tbad[0],
+                               poff.get("y", 0) - Tbad[1]) < 0.01,
+          str(poff))
+    check("残差近零", roff.get("max_residual_ms", 9) <= 0.01)
+
+    print("== 7d) 高非对称几何下真实越界仍被拒绝 ==")
+    req_ov = asymmetric_clock_case(target=(3.7, 2.8), e_t=0.221,
+                                   drift_ppms=(60.0, 10.0, -5.0),
+                                   ppm_limit=50.0, tol_ms=0.05, ncand=2)
+    try:
+        solve(req_ov)
+        check("真实越界仍被拒绝", False)
+    except LocateError as e:
+        check("真实越界仍被拒绝", e.code == "DRIFT_EXCEEDED", e.message)
 
     print("== 8) 歧义场景（第 4 麦候选覆盖宽，两组组合均在容限内）==")
     # 3 个锚点麦给出精确双曲线交点，第 4 麦给一串密候选（弱信号麦）：

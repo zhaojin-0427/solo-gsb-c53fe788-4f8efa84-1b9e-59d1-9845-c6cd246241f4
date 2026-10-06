@@ -2,8 +2,10 @@
 
 流程：
 1. 校验输入（房间、麦克风非共线、声速、ppm、容限、分辨率、两次校准事件的顺序）。
-2. 以 0 号麦为时基，用两次位置已知的校准敲击线性拟合各麦时钟的偏移与速率，
-   检查漂移是否超过 ppm 上限。
+2. 以 0 号麦为时基，用两次位置已知的校准敲击拟合各麦时钟的偏移与速率。
+   时钟关系 t = o + (1+δ)(e + g)：传播耗时 g 是物理时间，进入本地读数时同样
+   被 (1+δ) 缩放。速率由「本地到达间隔 / 物理到达间隔（发射间隔+该麦传播时差）」
+   给出，偏移由同一关系在校准点取等式；漂移超过 ppm 上限即报错。
 3. 把目标敲击各麦候选峰时刻换算到 0 号麦时基，与候选强度一同进入组合搜索。
 4. 枚举锚点三麦（0 号麦 + 一对非共线麦）全部候选组合，双曲线交点给出闭式种子；
    必要时用房间网格兜底，防止数值退化漏解。
@@ -185,7 +187,12 @@ def validate_and_calibrate(req: dict) -> tuple[float, float, float, np.ndarray, 
             raise LocateError("CALIBRATION_REVERSED",
                               f"麦克风 {i + 1} 的两次校准到达时刻不是严格递增")
 
-    # --- 时钟线性校准：t0 = (t - o) / (1 + δ)，两点恰好确定 δ 与 o ---
+    # --- 时钟线性校准 -----------------------------------------------------
+    # 物理时刻关系（各麦独立时钟，t0 为 0 号麦时基，约定 0 号麦 o=0、δ=0）：
+    #   发射时刻 e；声波传播到 i 号麦耗时 g_i = |p - mic_i| / c（物理时间）
+    #   物理到达时刻 = e + g_i；i 号麦本地读数 t_i = o + (1+δ)(e + g_i)
+    # 注意传播时间是物理时间，进入本地读数时同样被 (1+δ) 缩放，不能先从本地
+    # 读数里无缩放地扣除 g_i 再反推发射时刻。
     e_a0 = t0_a - geo_a
     e_b0 = t0_b - geo_b
     if e_b0 <= e_a0:  # 前置几何检查的冗余兜底
@@ -196,18 +203,18 @@ def validate_and_calibrate(req: dict) -> tuple[float, float, float, np.ndarray, 
     for i in range(1, n):
         ga = _dist2(cal_pts[0][0], cal_pts[0][1], mic_xy[i, 0], mic_xy[i, 1]) / c
         gb = _dist2(cal_pts[1][0], cal_pts[1][1], mic_xy[i, 0], mic_xy[i, 1]) / c
-        # 各麦自身时钟反推的发射时刻（含未知偏置与速率）
-        e_a_i = cal_rows[0][i] - ga
-        e_b_i = cal_rows[1][i] - gb
-        span = e_b_i - e_a_i
-        if span <= 0:
+        dt_local = cal_rows[1][i] - cal_rows[0][i]  # 本地读数的到达间隔
+        # 速率：两次敲击在 i 号麦的【物理】到达间隔等于发射间隔（首麦时基）
+        # 加该麦的传播时差，与首麦几何无关；本地到达间隔是它的 (1+δ) 倍：
+        #   1+δ = Δt本地 / ((e_b0 - e_a0) + (gb - ga))
+        span_phys = (e_b0 - e_a0) + (gb - ga)
+        if span_phys <= 0:
             raise LocateError("CALIBRATION_REVERSED",
-                              f"麦克风 {i + 1} 反推的两次发射时刻间隔非正，校准数据自相矛盾")
-        # 到达模型 t = o + (1+δ)·t0，发射时刻间隔与几何无关，
-        # 故速率由「反推发射间隔」之比给出
-        d = span / (e_b0 - e_a0) - 1.0
-        # 校准点 A：t_a^i = o + (1+δ)(e_a0 + g_a) = o + (1+δ)(t0_a - g_a^0) + g_a
-        o = cal_rows[0][i] - (1.0 + d) * (t0_a - geo_a) - ga
+                              f"麦克风 {i + 1} 的两次物理到达时刻间隔非正，校准数据自相矛盾")
+        d = dt_local / span_phys - 1.0
+        # 偏移：用同一个时钟关系在 A 点取等式
+        #   t_a^i = o + (1+δ)·(e_a0 + ga)
+        o = cal_rows[0][i] - (1.0 + d) * (e_a0 + ga)
         drift[i] = d
         offset[i] = o
         clock_summary.append({
