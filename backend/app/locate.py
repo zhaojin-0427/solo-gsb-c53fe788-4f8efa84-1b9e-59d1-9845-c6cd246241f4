@@ -2,7 +2,8 @@
 
 流程：
 1. 校验输入（房间、麦克风非共线、声速、ppm、容限、分辨率、两次校准事件的顺序）。
-2. 以 0 号麦为时基，用两次位置已知的校准敲击线性拟合各麦时钟的偏移与速率，
+2. 以 0 号麦为时基，按 t = o + (1+δ)(e + g)（e 发射时刻、g 传播时长，均被该麦
+   速率缩放）用两次位置已知的校准敲击线性拟合各麦时钟的偏移与速率，
    检查漂移是否超过 ppm 上限。
 3. 把目标敲击各麦候选峰时刻换算到 0 号麦时基，与候选强度一同进入组合搜索。
 4. 枚举锚点三麦（0 号麦 + 一对非共线麦）全部候选组合，双曲线交点给出闭式种子；
@@ -186,6 +187,13 @@ def validate_and_calibrate(req: dict) -> tuple[float, float, float, np.ndarray, 
                               f"麦克风 {i + 1} 的两次校准到达时刻不是严格递增")
 
     # --- 时钟线性校准：t0 = (t - o) / (1 + δ)，两点恰好确定 δ 与 o ---
+    # 发射、传播与本地到达读数的关系：敲击在首麦时基时刻 e 发射，经物理
+    # 传播时长 g_i 到达麦 i，该麦读数为
+    #     t_i = o_i + (1+δ_i)·(e + g_i)
+    # 传播发生在物理时间里，g_i 与发射时刻一样被该麦速率 (1+δ_i) 缩放。
+    # 因此速率估计必须把传播时差并进「首麦时基下到达该麦的间隔」（分母），
+    # 不能先从本地读数中按未缩放值扣除 g_i——否则两校准点到某麦路程不同
+    # 且该麦有漂移时，δ 会被低估/高估 δ·(g_b−g_a)/(e_b−e_a)，偏移随之带偏。
     e_a0 = t0_a - geo_a
     e_b0 = t0_b - geo_b
     if e_b0 <= e_a0:  # 前置几何检查的冗余兜底
@@ -196,18 +204,19 @@ def validate_and_calibrate(req: dict) -> tuple[float, float, float, np.ndarray, 
     for i in range(1, n):
         ga = _dist2(cal_pts[0][0], cal_pts[0][1], mic_xy[i, 0], mic_xy[i, 1]) / c
         gb = _dist2(cal_pts[1][0], cal_pts[1][1], mic_xy[i, 0], mic_xy[i, 1]) / c
-        # 各麦自身时钟反推的发射时刻（含未知偏置与速率）
-        e_a_i = cal_rows[0][i] - ga
-        e_b_i = cal_rows[1][i] - gb
-        span = e_b_i - e_a_i
-        if span <= 0:
+        # 分子：该麦本地读数间隔（单调性检查已保证为正）；
+        # 分母：同一对事件在首麦时基下到达该麦的间隔 (e_b0+g_b)−(e_a0+g_a)
+        local_span = cal_rows[1][i] - cal_rows[0][i]
+        ref_span = (e_b0 - e_a0) + (gb - ga)
+        if ref_span <= 0:
             raise LocateError("CALIBRATION_REVERSED",
-                              f"麦克风 {i + 1} 反推的两次发射时刻间隔非正，校准数据自相矛盾")
-        # 到达模型 t = o + (1+δ)·t0，发射时刻间隔与几何无关，
-        # 故速率由「反推发射间隔」之比给出
-        d = span / (e_b0 - e_a0) - 1.0
-        # 校准点 A：t_a^i = o + (1+δ)(e_a0 + g_a) = o + (1+δ)(t0_a - g_a^0) + g_a
-        o = cal_rows[0][i] - (1.0 + d) * (t0_a - geo_a) - ga
+                              f"麦克风 {i + 1} 的两次校准到达间隔在首麦时基下非正，"
+                              "校准数据自相矛盾")
+        # 到达模型 t = o + (1+δ)(e + g) 对两次校准作差，速率由
+        # 「本地读数间隔 / 首麦时基到达间隔」给出
+        d = local_span / ref_span - 1.0
+        # 同一时钟关系代入校准点 A：t_a^i = o + (1+δ)(e_a0 + g_a)
+        o = cal_rows[0][i] - (1.0 + d) * (e_a0 + ga)
         drift[i] = d
         offset[i] = o
         clock_summary.append({

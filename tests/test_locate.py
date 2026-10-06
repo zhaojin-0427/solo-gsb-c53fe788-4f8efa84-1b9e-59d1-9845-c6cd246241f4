@@ -111,6 +111,53 @@ def check(name, cond, detail=""):
 check.failed = 0
 
 
+def build_case_clock(drift2_ppm, limit_ppm, tol_ms=0.01, target=(3.2, 2.1),
+                     ncand=6, seed=5):
+    """显式漂移/偏移的时钟校准用例（回归：非对称校准几何下的速率/偏移估计）。
+
+    校准点 A 紧贴 2 号麦、B 远在对角，两校准点到 2 号麦的传播时差约 24 ms，
+    占 0.8 s 发射间隔约 3%。若速率估计先把未按 (1+δ) 缩放的传播时间从本地
+    读数中扣除，δ 会偏 δ·(g_b−g_a)/(e_b−e_a) ≈ 1.5 ppm，把近上限合法输入
+    误判为越界，偏移也随之带偏。
+    """
+    rng = random.Random(seed)
+    mics = make_mics(4)
+    drifts = [0.0, drift2_ppm * 1e-6, -20e-6, 10e-6]
+    offsets = [0.0, 0.012, -0.008, 0.005]
+    cal_a, cal_b = (7.4, 0.6), (0.6, 5.4)
+    e_a, e_b, e_t = 0.100, 0.900, 0.35
+
+    def arrivals(pt, e):
+        return [offsets[i] + (1.0 + drifts[i]) *
+                (e + float(np.linalg.norm(np.array(pt) - np.array(m))) / C)
+                for i, m in enumerate(mics)]
+
+    t_arr = arrivals(target, e_t)
+    cands = []
+    for i in range(4):
+        times = [t_arr[i]] + [t_arr[i] + rng.uniform(0.0012, 0.018)
+                              for _ in range(ncand - 1)]
+        times.sort()
+        cands.append([{"time": t, "strength": 0.35 if k == 0 else 8.0}
+                      for k, t in enumerate(times)])
+    req = {
+        "room": {"width": W, "height": H},
+        "microphones": [{"x": x, "y": y} for x, y in mics],
+        "sound_speed": C,
+        "drift_ppm": limit_ppm,
+        "tdoa_tolerance_ms": tol_ms,
+        "resolution": 0.05,
+        "calibrations": [
+            {"position": {"x": cal_a[0], "y": cal_a[1]},
+             "arrivals": arrivals(cal_a, e_a)},
+            {"position": {"x": cal_b[0], "y": cal_b[1]},
+             "arrivals": arrivals(cal_b, e_b)},
+        ],
+        "target": {"candidates": cands},
+    }
+    return req, drifts, offsets
+
+
 def main():
     print("== 1) 4 麦基础定位（弱直达 + 强回声）==")
     req, targets = build_case(n=4, target=(3.2, 2.1), seed=1, tol_ms=0.01)
@@ -257,6 +304,38 @@ def main():
         worst = max(worst, time.perf_counter() - t0)
         check(f"种子{seed}定位成功", rw["status"] == "OK", rw.get("message", ""))
     check("最差用时 < 5 秒", worst < 5.0, f"{worst:.2f}s")
+
+    print("== 12) 近上限漂移 + 非对称校准几何（不得误报 DRIFT_EXCEEDED）==")
+    # 真实漂移 ±49 ppm（上限 50 ppm，合法）；旧算法在此几何下会估出
+    # ±50.5 ppm 而误报越界。修复后应恢复真实漂移/偏移并精确定位。
+    for sign in (1.0, -1.0):
+        req_c, drifts, offsets = build_case_clock(sign * 49.0, 50.0)
+        try:
+            rc = solve(req_c)
+        except LocateError as e:
+            check(f"合法近上限输入（{sign * 49:+.0f} ppm）不被误报", False,
+                  f"{e.code}: {e.message}")
+            continue
+        check(f"合法近上限输入（{sign * 49:+.0f} ppm）不被误报",
+              rc["status"] in ("OK", "AMBIGUOUS"), rc.get("message", ""))
+        ck = {c["mic"]: c for c in rc.get("clock_calibration", [])}
+        check("恢复真实漂移", abs(ck[2]["drift_ppm"] - sign * 49.0) < 1e-3,
+              f"估计 {ck[2]['drift_ppm']:.4f} ppm")
+        check("恢复真实偏移", abs(ck[2]["offset_ms"] - 12.0) < 1e-3,
+              f"估计 {ck[2]['offset_ms']:.4f} ms")
+        pc = rc["position"]
+        check("定位精确", np.hypot(pc["x"] - 3.2, pc["y"] - 2.1) < 0.01,
+              f"err={np.hypot(pc['x'] - 3.2, pc['y'] - 2.1) * 1000:.2f}mm")
+        check("残差远小于容限", rc["max_residual_ms"] < 1e-3,
+              f"{rc['max_residual_ms']:.6f} ms")
+
+    print("== 13) 同一几何下真实越界仍报 DRIFT_EXCEEDED ==")
+    req_x, _, _ = build_case_clock(51.0, 50.0)
+    try:
+        solve(req_x)
+        check("真实越界被拒绝", False)
+    except LocateError as e:
+        check("真实越界被拒绝", e.code == "DRIFT_EXCEEDED", e.message)
 
     print(f"\n失败数: {check.failed}")
     sys.exit(1 if check.failed else 0)
